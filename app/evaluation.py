@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import math
 from dataclasses import dataclass
 from typing import Dict, List
@@ -143,6 +144,23 @@ class RagasEvaluationService:
                 "RAGAS 在当前项目中评估的是单轮问答质量，不会复用当前会话历史。",
             ],
         )
+
+    def run_sample_benchmark_threadsafe(self, session: SessionState) -> EvaluationResponse:
+        try:
+            asyncio.get_running_loop()
+            return self.run_sample_benchmark(session)
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(loop)
+                return self.run_sample_benchmark(session)
+            finally:
+                try:
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                except Exception:
+                    pass
+                asyncio.set_event_loop(None)
+                loop.close()
 
     def _ensure_sample_docs_loaded(self, session: SessionState) -> None:
         source_names = {document.source_name for document in session.documents.values()}

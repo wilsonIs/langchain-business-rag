@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import List
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -55,6 +56,10 @@ evaluation_service = RagasEvaluationService(rag_service, embedding_service)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+
+
+def sse_event(event: str, data) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 def create_app() -> FastAPI:
@@ -158,8 +163,38 @@ def create_app() -> FastAPI:
         except RuntimeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.post("/api/chat/stream")
+    async def chat_stream(payload: ChatRequest):
+        session = session_manager.get_or_create(payload.session_id)
+        question = payload.question.strip()
+        if not question:
+            raise HTTPException(status_code=400, detail="问题不能为空。")
+        try:
+            rag_service.ensure_ready(session)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        async def event_stream():
+            try:
+                async for event in rag_service.stream_ask(session, question):
+                    yield sse_event(event["event"], event["data"])
+            except RuntimeError as exc:
+                yield sse_event("error", {"detail": str(exc)})
+            except Exception as exc:
+                yield sse_event("error", {"detail": f"流式回答失败: {exc}"})
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     @app.post("/api/evaluate", response_model=EvaluationResponse)
-    def evaluate_sample_benchmark(payload: EvaluationRequest):
+    async def evaluate_sample_benchmark(payload: EvaluationRequest):
         session = session_manager.get_or_create(payload.session_id)
         try:
             return evaluation_service.run_sample_benchmark(session)

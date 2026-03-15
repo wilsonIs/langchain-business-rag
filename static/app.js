@@ -132,10 +132,7 @@ function renderHealth(data) {
     .join("");
 }
 
-function renderMessage(role, content, extra = {}) {
-  const wrapper = document.createElement("div");
-  wrapper.className = `message ${role}`;
-
+function buildMessageHtml(role, content, extra = {}) {
   const citations = (extra.citations || [])
     .map(
       (item) =>
@@ -159,11 +156,11 @@ function renderMessage(role, content, extra = {}) {
     ? `<div class="meta-row"><span class="chip">检索改写: ${escapeHtml(extra.rewritten_question)}</span></div>`
     : "";
 
-  const grounded = role === "assistant"
+  const grounded = role === "assistant" && typeof extra.grounded === "boolean"
     ? `<div class="meta-row"><span class="chip">${extra.grounded ? "已命中证据" : "证据不足"}</span></div>`
     : "";
 
-  wrapper.innerHTML = `
+  return `
     <div class="role">${role === "user" ? "User" : "Assistant"}</div>
     <div class="content">${escapeHtml(content)}</div>
     ${grounded}
@@ -171,7 +168,20 @@ function renderMessage(role, content, extra = {}) {
     ${citations ? `<div class="citation-row">${citations}</div>` : ""}
     ${sourceDocuments ? `<div class="source-row">${sourceDocuments}</div>` : ""}
   `;
+}
+
+function renderMessage(role, content, extra = {}) {
+  const wrapper = document.createElement("div");
+  wrapper.className = `message ${role}`;
+  wrapper.innerHTML = buildMessageHtml(role, content, extra);
   els.chatLog.appendChild(wrapper);
+  els.chatLog.scrollTop = els.chatLog.scrollHeight;
+  return wrapper;
+}
+
+function updateMessage(wrapper, role, content, extra = {}) {
+  wrapper.className = `message ${role}`;
+  wrapper.innerHTML = buildMessageHtml(role, content, extra);
   els.chatLog.scrollTop = els.chatLog.scrollHeight;
 }
 
@@ -347,22 +357,120 @@ async function sendQuestion(event) {
   els.chatInput.value = "";
   setBusy(true);
   setStatus("正在进行检索和回答...");
+  const assistantMessage = renderMessage("assistant", "正在检索相关片段...");
 
   try {
-    const data = await request("/api/chat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: state.sessionId, question }),
-    });
-    renderMessage("assistant", data.answer, data);
+    const data = await streamChat(question, assistantMessage);
     await refreshHealth();
-    setStatus("回答完成。");
+    setStatus(data.grounded ? "回答完成。" : "回答完成，但证据不足时已自动降级为“我不知道”。");
   } catch (error) {
-    renderMessage("assistant", `失败: ${error.message}`);
+    updateMessage(assistantMessage, "assistant", `失败: ${error.message}`);
     setStatus(error.message);
   } finally {
     setBusy(false);
   }
+}
+
+async function streamChat(question, assistantMessage) {
+  const response = await fetch("/api/chat/stream", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session_id: state.sessionId, question }),
+  });
+
+  if (!response.ok) {
+    const data = await response.json();
+    throw new Error(data.detail || "请求失败");
+  }
+  if (!response.body) {
+    throw new Error("浏览器未收到流式响应。");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  let content = "";
+  let finalPayload = null;
+  let assistantState = {
+    grounded: null,
+    rewritten_question: "",
+    citations: [],
+    source_documents: [],
+  };
+
+  const applyEvent = (eventName, payload) => {
+    if (eventName === "meta") {
+      assistantState = { ...assistantState, ...payload };
+      if (!content) {
+        updateMessage(assistantMessage, "assistant", "正在生成回答...", assistantState);
+      }
+      return;
+    }
+
+    if (eventName === "delta") {
+      content += payload.text || "";
+      updateMessage(assistantMessage, "assistant", content || "正在生成回答...", assistantState);
+      return;
+    }
+
+    if (eventName === "final") {
+      finalPayload = payload;
+      assistantState = payload;
+      content = payload.answer || content;
+      updateMessage(assistantMessage, "assistant", content, assistantState);
+      return;
+    }
+
+    if (eventName === "error") {
+      throw new Error(payload.detail || "流式响应失败");
+    }
+  };
+
+  const flushBuffer = () => {
+    while (buffer.includes("\n\n")) {
+      const boundary = buffer.indexOf("\n\n");
+      const rawEvent = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      if (!rawEvent.trim()) {
+        continue;
+      }
+
+      let eventName = "message";
+      const dataLines = [];
+      rawEvent.split("\n").forEach((line) => {
+        if (line.startsWith("event:")) {
+          eventName = line.slice(6).trim();
+          return;
+        }
+        if (line.startsWith("data:")) {
+          dataLines.push(line.slice(5).trim());
+        }
+      });
+      if (!dataLines.length) {
+        continue;
+      }
+      applyEvent(eventName, JSON.parse(dataLines.join("\n")));
+    }
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+    flushBuffer();
+    if (done) {
+      break;
+    }
+  }
+
+  if (buffer.trim()) {
+    buffer += "\n\n";
+    flushBuffer();
+  }
+
+  if (!finalPayload) {
+    throw new Error("流式响应提前结束，未收到最终结果。");
+  }
+  return finalPayload;
 }
 
 async function runEvaluation() {
